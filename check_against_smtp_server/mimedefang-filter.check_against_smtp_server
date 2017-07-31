@@ -1,0 +1,166 @@
+# [...]
+
+use Net::SMTP;
+use Authen::SASL;
+
+# [...]
+
+sub parse_smtp_cmd_return($$$$) {
+    my ($code, $message, $recip, $server) = @_;
+
+    my ($text, $retval, $dsn);
+
+    $message =~ s/\r\n\z//;
+
+    if ($message =~ /^(\d\.\d{1,3}\.\d{1,3})\s+(.*)$/) {
+        $dsn  = $1;
+        $text = $2;
+    } else {
+        $dsn  = '';
+        $text = $message;
+    }
+
+    if ($code =~ /^[123]/) {
+        $retval = 'CONTINUE';
+    } elsif ($code =~ /^4/) {
+        md_syslog('info', "check_against_smtp_server for $recip on $server returned $code $dsn $text");
+        $retval = 'TEMPFAIL';
+    } elsif ($code =~ /^5/) {
+        md_syslog('info', "check_against_smtp_server for $recip on $server returned $code $dsn $text");
+        $retval = 'REJECT';
+    } else {
+        md_syslog('warning', "Invalid SMTP reply code $code from server $server for $recip");
+        $retval = 'TEMPFAIL';
+    }
+
+    return ($retval, $code, $dsn, $text);
+}
+
+sub check_against_smtp_server($$$$;$;$) {
+    my ($sender, $recip, $helo, $server, $ref_starttls_options, $ref_auth_sasl) = @_;
+
+    my %starttls_options = ();
+    my $auth_sasl        = undef;
+
+    if (ref($ref_starttls_options) eq 'HASH') {
+        %starttls_options = %{$ref_starttls_options};
+    }
+
+    if (ref($ref_auth_sasl) eq 'REF') {
+        $auth_sasl = ${$ref_auth_sasl};
+    }
+
+    my ($retval, $code, $dsn, $text);
+
+    my %smtp_options = (
+        'Host'    => $server,
+        'Hello'   => $helo,
+        'Timeout' => 15,
+        'Debug'   => 0,
+    );
+
+    my $smtp = Net::SMTP->new(%smtp_options);
+
+    if (!defined($smtp)) {
+        md_syslog('warning', "check_against_smtp_server: failed to etablish connection to server $server: $@");
+        return ('TEMPFAIL', "Resource unavailable");
+    }
+
+    if (%starttls_options) {
+        if (defined($smtp->supports('STARTTLS'))) {
+            unless (defined($smtp->starttls(%starttls_options))) {
+                md_syslog('warning', "check_against_smtp_server: STARTTLS failed on server $server for $recip");
+                return ('TEMPFAIL', "Resource unavailable");
+            }
+        }
+    }
+
+    if (defined($auth_sasl) && $smtp->auth($auth_sasl) != 1) {
+        ($retval, $code, $dsn, $text) = parse_smtp_cmd_return($smtp->code(), $smtp->message(), $recip, $server);
+
+        $smtp->quit;
+
+        return ($retval, $text, $code, $dsn);
+    }
+
+    if ($smtp->mail($sender) != 1) {
+        ($retval, $code, $dsn, $text) = parse_smtp_cmd_return($smtp->code(), $smtp->message(), $recip, $server);
+
+        $smtp->quit;
+
+        return ($retval, $text, $code, $dsn);
+    }
+
+    $smtp->to($recip);
+    ($retval, $code, $dsn, $text) = parse_smtp_cmd_return($smtp->code(), $smtp->message(), $recip, $server);
+
+    $smtp->quit;
+
+    return ($retval, $text, $code, $dsn);
+}
+
+# [...]
+
+#
+# Example for using check_against_smtp_server() with STARTTLS
+#
+
+sub filter_recipient_starttls {
+    my ($recip, $sender, $ip, $host, $first, $helo, $rcpt_mailer, $rcpt_host, $rcpt_addr) = @_;
+
+    # fill %SendmailMacros
+    read_commands_file();
+
+    # [...]
+
+    my ($retval, $text);
+
+    my %starttls_options = (
+        'SSL_verify_mode' => 0,
+    );
+
+    if (defined($SendmailMacros{'client_cert_file'}) && defined($SendmailMacros{'client_key_file'})) {
+        if (-r $SendmailMacros{'client_cert_file'} && -r $SendmailMacros{'client_key_file'}) {
+            $starttls_options{'SSL_cert_file'} = $SendmailMacros{'client_cert_file'};
+            $starttls_options{'SSL_key_file'}  = $SendmailMacros{'client_key_file'};
+        } else {
+            md_syslog('warning', "filter_recipient: " . $SendmailMacros{'client_cert_file'} . " or " . $SendmailMacros{'client_key_file'} . " is not readable");
+        }
+    }
+
+    ($retval, $text) = check_against_smtp_server($sender, $recip, $SendmailMacros{'j'}, $server, \%starttls_options);
+
+    return ($retval, $text);
+}
+
+#
+# Example for using check_against_smtp_server() with AUTH
+#
+
+sub filter_recipient_auth {
+    my ($recip, $sender, $ip, $host, $first, $helo, $rcpt_mailer, $rcpt_host, $rcpt_addr) = @_;
+
+    # fill %SendmailMacros
+    read_commands_file();
+
+    # [...]
+
+    my ($retval, $text);
+
+    my $sasl = Authen::SASL->new(
+        mechanism => 'CRAM-MD5',
+        callback  => {
+            user => 'franz@electromail.org',
+            pass => '8Td8XQBBsgH2y',           # no real password :-)
+        },
+    );
+
+    ($retval, $text) = check_against_smtp_server($sender, $recip, $SendmailMacros{'j'}, $server, undef, \$sasl);
+
+    return ($retval, $text);
+}
+
+# [...]
+
+# DO NOT delete the next line, or Perl will complain.
+1;
